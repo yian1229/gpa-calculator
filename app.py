@@ -89,44 +89,47 @@ def perform_ocr(image, tesseract_cmd=None):
 
 def parse_with_deepseek(ocr_text, api_key):
     """
-    使用 DeepSeek API 清洗和结构化数据
+    使用 DeepSeek API 清洗和结构化数据 (终极优化版)
     """
     if not ocr_text or "Error" in ocr_text:
         return []
 
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
-    # 针对用户反馈的痛点进行 Prompt 深度优化
+    # 针对用户反馈的痛点进行 Prompt 终极深度优化
     prompt = f"""
-    你是一个专业的数据提取助手。请从包含重复内容的 OCR 文本中提取成绩信息。
+    你是一个拥有高级纠错能力的教务数据提取专家。请处理以下包含噪音和重复内容的 OCR 文本。
     
     OCR 文本内容 (包含原图和处理后图像的识别结果):
     {ocr_text}
     
-    CRITICAL RULES (关键规则):
-    1. **关于“形势与政策”等无学分课程**:
-       - 某些课程可能**没有显示学分**（例如只有课程名和成绩）。
-       - 如果找不到明确的学分数值，**默认设置 credit = 0**。
-       - **绝对不要因为缺少学分就停止提取后续课程！** 必须提取所有可见的课程。
+    === 核心任务 ===
+    提取所有课程的：1. 科目名称 (subject)  2. 成绩 (score)  3. 学分 (credit)
     
-    2. **成绩提取 (Score)**:
-       - 优先提取行尾的**大数字**（60-100）。
-       - 忽略“平时成绩”、“期中”等小分。
-       - 示例: "平时成绩: 38 绩点: 4.5 95" -> 提取 **95**。
+    === 强制纠错规则 (HIGHEST PRIORITY) ===
+    1. **特定课程修正**:
+       - **“习近平新时代中国特色社会主义思想概论”**: 这门课的标准学分是 **3.0**。OCR 经常将“3”误识别为“5”或“8”。如果你看到 5 学分，**必须强制修正为 3 学分**。
+       - **“形势与政策”**: 这门课通常没有显示学分，或者学分很少。如果找不到学分，**必须保留该课程并设学分为 0**。不要因为缺学分而丢弃它。
     
-    3. **学分提取 (Credit)**:
-       - 寻找 "限选 - 3 学分", "必修 2 学分" 等模式。
-       - 如果找不到，设为 0。
+    2. **学分 (Credit) 识别逻辑**:
+       - 常见学分值：0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0。
+       - **异常值警惕**：如果识别出 5.0, 6.0, 8.0 等非常规学分，请结合上下文（如“限选 - X 学分”）仔细辨别。如果看起来像 OCR 错误（如 3 变成 5），请修正为最可能的常见值（通常是 3 或 4）。
+       - 格式提取：优先寻找 "限选 - 3 学分", "必修 2 学分", "3 学分" 等明确字样。
     
-    4. **数据去重与融合**:
-       - OCR 文本包含两份来源（Source A 和 Source B），内容会高度重复。
-       - 请根据课程名称进行去重，合并信息。
-       - 如果 Source A 识别到了课程名但没成绩，Source B 识别到了成绩，请把它们拼在一起。
-
-    输出格式 (JSON List):
+    3. **成绩 (Score) 识别逻辑**:
+       - 目标：**最终总成绩**。
+       - 特征：通常是行尾的、字号较大的、蓝色的（在原图中）、介于 0-100 之间的整数。
+       - **排除干扰**：绝对忽略“平时成绩: 90”、“期中: 88”、“绩点: 4.5”等干扰项。如果一行有 [38, 4.5, 95]，取 **95**。
+    
+    4. **去重与合并**:
+       - 输入包含两次识别结果（Source A/B）。请整合两者的信息，输出一份干净的、不重复的课程列表。
+    
+    === 输出格式 ===
+    仅输出标准的 JSON 列表，严禁包含 ```json 代码块标记或其他废话。
+    示例:
     [
-        {{"subject": "形势与政策", "score": 86, "credit": 0}},
-        {{"subject": "ERP原理", "score": 96, "credit": 3.0}}
+        {{"subject": "习近平新时代中国特色社会主义思想概论", "score": 94, "credit": 3.0}},
+        {{"subject": "形势与政策", "score": 86, "credit": 0.0}}
     ]
     """
 
@@ -134,7 +137,7 @@ def parse_with_deepseek(ocr_text, api_key):
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "You are a robust data extraction assistant. Extract ALL subjects. Default credit to 0 if missing."},
+                {"role": "system", "content": "You are a precise data extraction engine. Correct OCR errors based on logic. Return JSON only."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1
@@ -142,13 +145,8 @@ def parse_with_deepseek(ocr_text, api_key):
         
         content = response.choices[0].message.content.strip()
         
-        # 清理可能存在的 markdown 标记
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
+        # 强力清洗 markdown 标记
+        content = content.replace("```json", "").replace("```", "").strip()
             
         data = json.loads(content)
         return data
