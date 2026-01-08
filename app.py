@@ -50,39 +50,42 @@ def preprocess_image(image):
 
 def perform_ocr(image, tesseract_cmd=None):
     """
-    使用 Tesseract 对图像进行 OCR 识别
+    使用 Tesseract 对图像进行 OCR 识别 (双重策略：原图 + 反相图)
     """
-    # 1. 优先使用用户传入的路径 (如果非空)
+    # 1. 设置 Tesseract 路径
     if tesseract_cmd and tesseract_cmd.strip():
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd.strip()
     else:
-        # 2. 尝试自动检测系统中的 tesseract
         if shutil.which("tesseract"):
-            # 在 Linux/Cloud 环境下通常能直接找到
             pytesseract.pytesseract.tesseract_cmd = "tesseract"
         else:
-            # 3. Windows 本地回退逻辑
             win_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
             if os.path.exists(win_path):
                 pytesseract.pytesseract.tesseract_cmd = win_path
     
     try:
-        # --- 增强版 OCR 逻辑 ---
-        # 1. 对原图进行预处理 (针对深色模式反相)
+        results = []
+        
+        # --- 策略 A: 原图识别 ---
+        # 针对部分非深色区域或正常文字
+        text_original = pytesseract.image_to_string(image, lang='chi_sim+eng')
+        results.append(f"--- Source A (Original) ---\n{text_original}")
+        
+        # --- 策略 B: 反相增强识别 ---
+        # 针对深色模式 (黑底白字)
         processed_image = preprocess_image(image)
+        text_inverted = pytesseract.image_to_string(processed_image, lang='chi_sim+eng')
+        results.append(f"--- Source B (Inverted) ---\n{text_inverted}")
         
-        # 2. 识别 (同时保留原图识别结果，防止反相错误)
-        # 这里我们只用处理后的图，因为 Tesseract 极其讨厌黑底
-        text = pytesseract.image_to_string(processed_image, lang='chi_sim+eng')
+        # 合并所有文本
+        return "\n".join(results)
         
-        return text
     except pytesseract.TesseractError as e:
         if "lang" in str(e):
-             return "Error: 请确保 Tesseract 安装了中文语言包 (chi_sim)。\n或者您可以尝试只识别数字和英文。"
+             return "Error: 请确保 Tesseract 安装了中文语言包 (chi_sim)。"
         return f"OCR Error: {e}"
     except Exception as e:
-        # Fallback provided in UI if tesseract is missing
-        return f"Error: 无法运行 Tesseract OCR。请确保已安装 Tesseract 并配置路径。\n详细错误: {e}"
+        return f"Error: 无法运行 Tesseract OCR。详细错误: {e}"
 
 def parse_with_deepseek(ocr_text, api_key):
     """
@@ -93,35 +96,37 @@ def parse_with_deepseek(ocr_text, api_key):
 
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
-    # 针对用户截图特点（黑底卡片式）优化 Prompt
+    # 针对用户反馈的痛点进行 Prompt 深度优化
     prompt = f"""
-    你是一个数据提取助手。请从下面的 OCR 识别文本中提取“科目名称”、“成绩”和“学分”。
+    你是一个专业的数据提取助手。请从包含重复内容的 OCR 文本中提取成绩信息。
     
-    OCR 文本内容：
+    OCR 文本内容 (包含原图和处理后图像的识别结果):
     {ocr_text}
     
-    核心提取规则 (CRITICAL):
-    1. **成绩 (Score)**: 
-       - 重点寻找位于行尾或独立的**大数值**（通常是 60-100 之间的整数）。
-       - **忽略**标记为“平时成绩”、“期中成绩”的小数值（通常 < 50）。
-       - 如果一行有多个数字，例如 "平时成绩: 29 绩点: 4.5 95"，取那个最大的 **95** 作为最终成绩。
-       
-    2. **学分 (Credit)**:
-       - 学分通常紧跟在课程名称下方或旁边。
-       - 寻找类似 "限选 - 3 学分"、"必修 - 2.0 学分"、"Credit: 3" 的模式。
-       - 如果找不到明确的“学分”字样，尝试寻找 0.5 到 6.0 之间的小数（通常是 1, 2, 3, 4, 0.5）。
-       
-    3. **科目名称 (Subject)**:
-       - 提取中文课程名。
-       
-    4. **去噪**: 
-       - 忽略 "学期 2025-2026-1"、"考试成绩" 等无关表头。
+    CRITICAL RULES (关键规则):
+    1. **关于“形势与政策”等无学分课程**:
+       - 某些课程可能**没有显示学分**（例如只有课程名和成绩）。
+       - 如果找不到明确的学分数值，**默认设置 credit = 0**。
+       - **绝对不要因为缺少学分就停止提取后续课程！** 必须提取所有可见的课程。
+    
+    2. **成绩提取 (Score)**:
+       - 优先提取行尾的**大数字**（60-100）。
+       - 忽略“平时成绩”、“期中”等小分。
+       - 示例: "平时成绩: 38 绩点: 4.5 95" -> 提取 **95**。
+    
+    3. **学分提取 (Credit)**:
+       - 寻找 "限选 - 3 学分", "必修 2 学分" 等模式。
+       - 如果找不到，设为 0。
+    
+    4. **数据去重与融合**:
+       - OCR 文本包含两份来源（Source A 和 Source B），内容会高度重复。
+       - 请根据课程名称进行去重，合并信息。
+       - 如果 Source A 识别到了课程名但没成绩，Source B 识别到了成绩，请把它们拼在一起。
 
-    输出格式:
-    标准的 JSON 列表，无 Markdown。
+    输出格式 (JSON List):
     [
-        {{"subject": "ERP原理", "score": 95, "credit": 3.0}},
-        {{"subject": "就业指导", "score": 85, "credit": 0.5}}
+        {{"subject": "形势与政策", "score": 86, "credit": 0}},
+        {{"subject": "ERP原理", "score": 96, "credit": 3.0}}
     ]
     """
 
@@ -129,7 +134,7 @@ def parse_with_deepseek(ocr_text, api_key):
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "You are a smart data extraction assistant. Output raw JSON only."},
+                {"role": "system", "content": "You are a robust data extraction assistant. Extract ALL subjects. Default credit to 0 if missing."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1
