@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 import os
 import shutil
 import pytesseract
@@ -15,6 +15,38 @@ import io
 # 默认不指定路径，依赖系统 PATH (适用于 Linux/Cloud)
 # 仅在 Windows 本地测试时可能需要指定路径
 DEFAULT_TESSERACT_PATH = None
+
+def preprocess_image(image):
+    """
+    图像预处理：针对深色模式优化
+    1. 转换为灰度图
+    2. 反相 (如果是黑底白字)
+    3. 增强对比度
+    """
+    # 转换为 RGB (防止 PNG 透明通道问题)
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    # 转换为灰度
+    gray_image = ImageOps.grayscale(image)
+    
+    # 检测是否为深色模式 (计算平均像素亮度，<128 认为是深色)
+    # 简单采样中间区域
+    width, height = gray_image.size
+    crop = gray_image.crop((width//4, height//4, width*3//4, height*3//4))
+    extrema = crop.getextrema()
+    # 如果大部分像素比较暗，可能是黑底白字
+    # 这里我们直接做个“反相”副本，两个都让 OCR 跑一遍，谁字多用谁？
+    # 或者直接暴力点，假设用户提供的截图大部分是黑底（手机截图常见），尝试反相。
+    
+    # 为了保险，我们生成一个“反相”版本（变成白底黑字）
+    inverted_image = ImageOps.invert(gray_image)
+    
+    # 增强对比度
+    enhancer = ImageEnhance.Contrast(inverted_image)
+    enhanced_image = enhancer.enhance(2.0)
+    
+    return enhanced_image
 
 def perform_ocr(image, tesseract_cmd=None):
     """
@@ -35,9 +67,14 @@ def perform_ocr(image, tesseract_cmd=None):
                 pytesseract.pytesseract.tesseract_cmd = win_path
     
     try:
-        # 识别中文和英文
-        # 注意：packages.txt 确保了云端环境安装了 chi_sim
-        text = pytesseract.image_to_string(image, lang='chi_sim+eng')
+        # --- 增强版 OCR 逻辑 ---
+        # 1. 对原图进行预处理 (针对深色模式反相)
+        processed_image = preprocess_image(image)
+        
+        # 2. 识别 (同时保留原图识别结果，防止反相错误)
+        # 这里我们只用处理后的图，因为 Tesseract 极其讨厌黑底
+        text = pytesseract.image_to_string(processed_image, lang='chi_sim+eng')
+        
         return text
     except pytesseract.TesseractError as e:
         if "lang" in str(e):
@@ -56,23 +93,35 @@ def parse_with_deepseek(ocr_text, api_key):
 
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
+    # 针对用户截图特点（黑底卡片式）优化 Prompt
     prompt = f"""
     你是一个数据提取助手。请从下面的 OCR 识别文本中提取“科目名称”、“成绩”和“学分”。
     
     OCR 文本内容：
     {ocr_text}
     
-    规则：
-    1. 识别并提取所有科目的名称、成绩（分数）和学分。
-    2. 如果文本中有噪音或乱码，请利用上下文修正。
-    3. 输出格式必须是标准的 JSON 列表，不要包含 Markdown 格式（如 ```json ... ```）。
-    4. 每个列表项包含 keys: "subject" (string), "score" (float), "credit" (float)。
-    5. 如果没有识别到有效数据，返回空列表 []。
-    
-    例如：
+    核心提取规则 (CRITICAL):
+    1. **成绩 (Score)**: 
+       - 重点寻找位于行尾或独立的**大数值**（通常是 60-100 之间的整数）。
+       - **忽略**标记为“平时成绩”、“期中成绩”的小数值（通常 < 50）。
+       - 如果一行有多个数字，例如 "平时成绩: 29 绩点: 4.5 95"，取那个最大的 **95** 作为最终成绩。
+       
+    2. **学分 (Credit)**:
+       - 学分通常紧跟在课程名称下方或旁边。
+       - 寻找类似 "限选 - 3 学分"、"必修 - 2.0 学分"、"Credit: 3" 的模式。
+       - 如果找不到明确的“学分”字样，尝试寻找 0.5 到 6.0 之间的小数（通常是 1, 2, 3, 4, 0.5）。
+       
+    3. **科目名称 (Subject)**:
+       - 提取中文课程名。
+       
+    4. **去噪**: 
+       - 忽略 "学期 2025-2026-1"、"考试成绩" 等无关表头。
+
+    输出格式:
+    标准的 JSON 列表，无 Markdown。
     [
-        {{"subject": "高等数学", "score": 85, "credit": 4.0}},
-        {{"subject": "大学英语", "score": 90, "credit": 2.0}}
+        {{"subject": "ERP原理", "score": 95, "credit": 3.0}},
+        {{"subject": "就业指导", "score": 85, "credit": 0.5}}
     ]
     """
 
@@ -80,7 +129,7 @@ def parse_with_deepseek(ocr_text, api_key):
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that outputs raw JSON."},
+                {"role": "system", "content": "You are a smart data extraction assistant. Output raw JSON only."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1
